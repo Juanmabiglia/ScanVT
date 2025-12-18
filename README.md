@@ -1,79 +1,81 @@
 # scanvt
 
-`scanvt` es una herramienta de escaneo de malware automatizado para sistemas Linux. Utiliza **ClamAV** para el análisis de archivos y **VirusTotal** para confirmar si las amenazas detectadas son reales o falsos positivos.
+`scanvt` es una herramienta de escaneo de malware automatizado para sistemas Linux. Utiliza **ClamAV** para el análisis rápido y **VirusTotal** para confirmar amenazas, reduciendo drásticamente los falsos positivos.
 
-**Novedad v1.1:** El núcleo ha sido reescrito en **Python 3** para mayor robustez y velocidad, integrándose nativamente con el daemon de ClamAV (`clamdscan`) para escaneos ultrarrápidos.
+**Versión 1.1:** Núcleo reescrito en Python 3 para máximo rendimiento, soporte para `clamdscan`, notificaciones modernas (Discord/Telegram) y configuración flexible.
 
 ## ✨ Características
 
-- **Alto Rendimiento:** Integración con `clamav-daemon` para escaneos instantáneos (sin tiempos de carga de DB).
-- **Inteligencia:** Consulta a la API de VirusTotal para verificar detecciones y reducir falsos positivos.
-- **Automatización:** Escaneo de archivos recientes o completos, gestionado por `systemd`.
-- **Seguridad:** Aislamiento inmediato de amenazas en cuarentena.
-- **Gestión de Falsos Positivos:** Restauración automática y Whitelist local si VirusTotal lo confirma limpio.
-- **Reportes:** Logs detallados, informes CSV y alertas por correo electrónico.
+- **Motor Híbrido:** Velocidad de ClamAV + Inteligencia de VirusTotal.
+- **Ultra Rápido:** Integración nativa con `clamav-daemon` (escaneo en memoria).
+- **Cero Falsos Positivos:** Verificación automática de amenazas contra múltiples motores antivirus.
+- **Modos de Acción:** Elige entre poner en `Cuarentena`, `Eliminar` o solo `Reportar`.
+- **Notificaciones Multi-canal:** Email, Discord, Slack y Telegram.
+- **Inteligente:** Ignora archivos gigantes, carpetas basura (`node_modules`, `.git`) y archivos ya analizados (caché de hashes).
+- **Reportes:** Historial CSV detallado y logs de auditoría.
 
-## 🔑 Cómo obtener tu API key de VirusTotal
+## 🔑 Requisitos
 
-1. Regístrate gratis en [VirusTotal](https://www.virustotal.com/gui/join-us).
-2. Ve a tu perfil > **API Key**.
-3. Copia la clave en `/etc/scanvt/config`:
-
-```bash
-VT_API_KEY="tu_clave_api_aqui"
-```
+1. **VirusTotal API Key:** Gratuita en [VirusTotal](https://www.virustotal.com).
+2. **Dependencias del Sistema:**
+   ```bash
+   sudo apt update
+   sudo apt install clamav clamav-daemon mailutils
+   ```
 
 ## 📦 Instalación
 
-### Requisitos Previos
-
-El sistema ahora requiere Python 3 (instalado por defecto en la mayoría de distros) y se recomienda encarecidamente `clamav-daemon` para velocidad.
-
 ```bash
-sudo apt update
-sudo apt install clamav clamav-daemon mailutils -y
-```
-
-### Instalación del Paquete
-
-```bash
+# Instalar paquete
 sudo dpkg -i scanvt_1.1_all.deb
+
+# Recargar servicios
 sudo systemctl daemon-reload
 sudo systemctl enable --now scanvt-generate.service scanvt.timer
 ```
 
-## ⚙️ Configuración
+## ⚙️ Configuración Avanzada
 
-Archivo: `/etc/scanvt/config`
+Edita el archivo `/etc/scanvt/config` para personalizar el comportamiento.
 
+### Básico
 ```bash
-# API Key de VirusTotal (Obligatorio)
-VT_API_KEY="tu_api_key_virustotal"
-
-# Directorios a vigilar
+VT_API_KEY="tu_clave_api_obligatoria"
 SCAN_DIRS=("/home" "/var/www")
-
-# Escanear archivos modificados en los últimos X días
-SCAN_DAYS=10
-
-# Hora del escaneo diario
-SCAN_HOUR="03:00"
-
-# Días de ejecución
-SCAN_DAYS_OF_WEEK="Mon,Tue,Wed,Thu,Fri"
-
-# Email para alertas
-MAIL_DEST="admin@tudominio.com"
-
-# Días para retener archivos en cuarentena (0 = nunca borrar)
-QUAR_RETENTION_DAYS=7
 ```
 
-## 🧪 Resultados
+### Comportamiento y Seguridad
+```bash
+# Cuántos motores deben confirmar virus para actuar (Recomendado: 2)
+VT_THRESHOLD=2
 
+# Qué hacer con el malware: "quarantine" (defecto), "delete", "report"
+ACTION_MODE="quarantine"
+
+# Ignorar archivos grandes (MB) para no saturar el sistema
+MAX_FILE_SIZE_MB=500
+
+# Excluir carpetas basura
+EXCLUDE_DIRS=("node_modules" ".git" "tmp" "venv")
+```
+
+### Notificaciones Modernas
+Descomenta las líneas en el archivo config para activarlas:
+
+```bash
+# Discord
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+
+# Telegram
+TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
+TELEGRAM_CHAT_ID="987654321"
+```
+
+## 🧪 Rutas Importantes
+
+- **Configuración:** `/etc/scanvt/config`
 - **Cuarentena:** `/var/quarantine`
 - **Logs:** `/var/log/scanvt/scan.log`
-- **Whitelist:** `/var/cache/scanvt/whitelist.txt`
 - **Reportes CSV:** `/root/scanvt/`
 
 ## 🔧 Mantenimiento

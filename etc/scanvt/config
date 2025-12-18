@@ -1,18 +1,62 @@
+# ==========================================
+# CONFIGURACIÓN DE SCANVT v1.1
+# ==========================================
 
-# API de VirusTotal
-VT_API_KEY="TU_API_KEY"
+# --- API VIRUSTOTAL (OBLIGATORIO) ---
+# Regístrate en https://www.virustotal.com para obtener tu clave gratuita.
+VT_API_KEY="tu_clave_api_aqui"
 
-# Carpeta(s) a escanear (usar array bash)
+# --- DIRECTORIOS A ESCANEAR ---
+# Lista de carpetas separadas por espacios dentro de paréntesis.
 SCAN_DIRS=("/home" "/var/www")
 
-# Cantidad de días para considerar archivos modificados recientemente
+# --- EXCLUSIONES ---
+# Carpetas a ignorar (nombres exactos). Útil para evitar node_modules, .git, etc.
+EXCLUDE_DIRS=("node_modules" ".git" "venv" "__pycache__" "tmp")
+
+# --- SENSIBILIDAD ---
+# Cantidad mínima de motores de VirusTotal que deben detectar virus para confirmar malware.
+# Recomendado: 2 o 3 para evitar falsos positivos de motores desconocidos.
+VT_THRESHOLD=2
+
+# --- RENDIMIENTO ---
+# No escanear archivos mayores a X Megabytes.
+MAX_FILE_SIZE_MB=200
+
+# Escanear solo archivos modificados en los últimos X días (excepto en el primer escaneo).
 SCAN_DAYS=10
 
-# Hora de escaneo diario (formato 24h: HH:MM)
+# --- MODO DE ACCIÓN ---
+# Opciones disponibles:
+#   "quarantine" : (Recomendado) Mueve el archivo a /var/quarantine. Si es FP, lo restaura.
+#   "delete"     : Elimina el archivo definitivamente si se confirma malware. (Peligroso)
+#   "report"     : Solo notifica y loguea. No mueve ni borra nada.
+ACTION_MODE="quarantine"
+
+# Días para guardar archivos en cuarentena antes de borrarlos (0 = nunca borrar).
+QUAR_RETENTION_DAYS=7
+
+# --- PROGRAMACIÓN AUTOMÁTICA ---
+# Hora del escaneo diario (formato 24h).
 SCAN_HOUR="03:00"
+# Días de ejecución (Mon,Tue,Wed,Thu,Fri,Sat,Sun).
+SCAN_DAYS_OF_WEEK="Mon,Tue,Wed,Thu,Fri"
 
-# Días de la semana en los que se ejecuta el escaneo (ej: Mon,Tue,Wed)
-SCAN_DAYS_OF_WEEK="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+# ==========================================
+# NOTIFICACIONES
+# ==========================================
 
-# Correo electrónico para alertas
+# 1. Correo Electrónico (Requiere comando 'mail' configurado en el sistema)
 MAIL_DEST="admin@tudominio.com"
+
+# 2. Discord Webhook
+# Crea un webhook en: Server Settings > Integrations > Webhooks
+# DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+
+# 3. Slack Webhook
+# SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+
+# 4. Telegram Bot
+# Obtén tu token con @BotFather y tu ID con @userinfobot
+# TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjkl..."
+# TELEGRAM_CHAT_ID="12345678"

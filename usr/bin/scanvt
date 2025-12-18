@@ -5,6 +5,7 @@ import subprocess
 import hashlib
 import json
 import urllib.request
+import urllib.parse
 import urllib.error
 import datetime
 import shutil
@@ -20,15 +21,23 @@ FIRST_SCAN_FLAG = "/var/cache/scanvt/.first_scan_done"
 CSV_DIR = "/root/scanvt"
 TIMESTAMP = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 CSV_FILE = f"{CSV_DIR}/scanvt_report_{TIMESTAMP}.csv"
-THRESHOLD = 1
 
-# Valores por defecto si falla la config
+# Valores por defecto
 CONFIG = {
     "VT_API_KEY": "",
     "SCAN_DIRS": [],
+    "EXCLUDE_DIRS": [".git", "node_modules", "tmp", "cache"], # Default excludes
     "SCAN_DAYS": 7,
     "MAIL_DEST": "root",
-    "QUAR_RETENTION_DAYS": 0
+    "QUAR_RETENTION_DAYS": 0,
+    "VT_THRESHOLD": 1,
+    "MAX_FILE_SIZE_MB": 100,
+    "ACTION_MODE": "quarantine", # report, quarantine, delete
+    # Notificaciones
+    "DISCORD_WEBHOOK_URL": "",
+    "SLACK_WEBHOOK_URL": "",
+    "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_CHAT_ID": ""
 }
 
 def log(message, level="INFO"):
@@ -42,7 +51,6 @@ def log(message, level="INFO"):
         print(f"Error escribiendo log: {e}")
 
 def parse_bash_config(file_path):
-    """Intenta leer variables simples y arrays de bash del archivo de config."""
     if not os.path.exists(file_path):
         return
     
@@ -50,31 +58,30 @@ def parse_bash_config(file_path):
         content = f.read()
 
     # Regex para arrays bash: VAR=("val1" "val2")
-    # Nota: Esto es un parser simple y puede fallar con estructuras complejas
     array_matches = re.findall(r'(\w+)=\((.*?)\)', content, re.DOTALL)
     for key, val_str in array_matches:
-        # Extraer items entre comillas
         items = re.findall(r'"([^"]*)"', val_str)
-        if not items: # Intentar sin comillas
-            items = val_str.split()
+        if not items: items = val_str.split()
         CONFIG[key] = items
 
-    # Regex para variables simples: VAR="valor" o VAR=valor
+    # Regex para variables simples: VAR="valor"
     simple_matches = re.findall(r'(\w+)=["\\]?([^"\'\n\(\)]+)["\\]?', content)
     for key, val in simple_matches:
-        if key not in CONFIG: # Prioridad al array si ya se encontró
+        if key not in CONFIG:
             CONFIG[key] = val
 
     # Conversiones de tipo
-    try:
-        CONFIG["SCAN_DAYS"] = int(CONFIG.get("SCAN_DAYS", 7))
-    except:
-        CONFIG["SCAN_DAYS"] = 7
-        
-    try:
-        CONFIG["QUAR_RETENTION_DAYS"] = int(CONFIG.get("QUAR_RETENTION_DAYS", 0))
-    except:
-        CONFIG["QUAR_RETENTION_DAYS"] = 0
+    try: CONFIG["SCAN_DAYS"] = int(CONFIG.get("SCAN_DAYS", 7))
+    except: CONFIG["SCAN_DAYS"] = 7
+    
+    try: CONFIG["QUAR_RETENTION_DAYS"] = int(CONFIG.get("QUAR_RETENTION_DAYS", 0))
+    except: CONFIG["QUAR_RETENTION_DAYS"] = 0
+
+    try: CONFIG["VT_THRESHOLD"] = int(CONFIG.get("VT_THRESHOLD", 1))
+    except: CONFIG["VT_THRESHOLD"] = 1
+    
+    try: CONFIG["MAX_FILE_SIZE_MB"] = int(CONFIG.get("MAX_FILE_SIZE_MB", 100))
+    except: CONFIG["MAX_FILE_SIZE_MB"] = 100
 
 def setup_env():
     dirs = [os.path.dirname(LOG_FILE), os.path.dirname(HASH_CACHE), QUAR_DIR, CSV_DIR]
@@ -111,35 +118,22 @@ def append_to_list(file_path, text):
         f.write(text + "\n")
 
 def scan_files(files_to_scan):
-    """Ejecuta clamdscan (o clamscan fallback) sobre una lista de archivos."""
-    if not files_to_scan:
-        return {}
-
+    if not files_to_scan: return {}
     infected_files = {}
     
-    # Intentar usar clamdscan (multithreaded daemon) primero
+    # 1. Intentar clamdscan
     cmd = ["clamdscan", "--no-summary", "--fdpass", "-"]
-    # Si no quieres usar stdin lista de archivos, clamdscan puede recibir argumentos, 
-    # pero args list puede ser muy largo. Pasar por stdin es mejor ("-").
-    
     try:
-        # Pasamos la lista de archivos via STDIN
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = proc.communicate(input="\n".join(files_to_scan))
-        
-        # Clamdscan return codes: 0: No virus, 1: Virus found, 2: Error
-        if proc.returncode == 2:
-            log("clamdscan reportó error (o no está corriendo). Intentando fallback a clamscan (lento).", "WARN")
-            raise Exception("clamdscan failed")
-            
-    except Exception as e:
-        # Fallback a clamscan (lento)
-        log("Usando clamscan fallback...", "INFO")
+        if proc.returncode == 2: raise Exception("clamdscan error")
+    except:
+        # 2. Fallback clamscan
+        log("Usando clamscan fallback (lento)...", "INFO")
         cmd = ["clamscan", "--no-summary", "-"]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = proc.communicate(input="\n".join(files_to_scan))
 
-    # Parsear salida: "/path/to/file: VirusName FOUND"
     for line in stdout.splitlines():
         if " FOUND" in line:
             parts = line.split(":")
@@ -147,158 +141,210 @@ def scan_files(files_to_scan):
                 file_path = parts[0].strip()
                 virus_name = parts[1].replace(" FOUND", "").strip()
                 infected_files[file_path] = virus_name
-
     return infected_files
 
 def check_virustotal(file_hash, api_key):
+    if not api_key: return -1
     url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
     headers = {"x-apikey": api_key}
     req = urllib.request.Request(url, headers=headers)
-    
     try:
         with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode())
-            stats = data['data']['attributes']['last_analysis_stats']
-            return stats['malicious']
+            return data['data']['attributes']['last_analysis_stats']['malicious']
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            log(f"Hash {file_hash} no encontrado en VirusTotal.", "INFO")
-            return 0 # Asumimos limpio si VT no lo conoce (o política estricta?)
-        log(f"Error consultando VirusTotal: {e}", "ERROR")
+        if e.code == 404: return 0 
+        log(f"Error VT API: {e}", "ERROR")
         return -1
-    except Exception as e:
-        log(f"Error general VT: {e}", "ERROR")
+    except Exception:
         return -1
 
-def send_alert(subject, body, dest):
-    if not dest or "@" not in dest:
-        return
+# --- Notificaciones ---
+def send_discord(message):
+    url = CONFIG.get("DISCORD_WEBHOOK_URL")
+    if not url: return
+    data = json.dumps({"content": message}).encode()
     try:
-        # Usar comando 'mail' del sistema
-        proc = subprocess.Popen(['mail', '-s', subject, dest], stdin=subprocess.PIPE, text=True)
-        proc.communicate(input=body)
-    except Exception as e:
-        log(f"No se pudo enviar correo: {e}", "ERROR")
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req)
+    except Exception as e: log(f"Error Discord: {e}", "ERROR")
+
+def send_slack(message):
+    url = CONFIG.get("SLACK_WEBHOOK_URL")
+    if not url: return
+    data = json.dumps({"text": message}).encode()
+    try:
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req)
+    except Exception as e: log(f"Error Slack: {e}", "ERROR")
+
+def send_telegram(message):
+    token = CONFIG.get("TELEGRAM_BOT_TOKEN")
+    chat_id = CONFIG.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id: return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode()
+    try:
+        urllib.request.urlopen(url, data=data)
+    except Exception as e: log(f"Error Telegram: {e}", "ERROR")
+
+def notify(subject, body):
+    # Email
+    if CONFIG["MAIL_DEST"] and "@" in CONFIG["MAIL_DEST"]:
+        try:
+            proc = subprocess.Popen(['mail', '-s', subject, CONFIG["MAIL_DEST"]], stdin=subprocess.PIPE, text=True)
+            proc.communicate(input=body)
+        except: pass
+    
+    # Modern Channels
+    full_msg = f"**{subject}**\n{body}"
+    send_discord(full_msg)
+    send_slack(full_msg)
+    send_telegram(full_msg)
+
+def should_exclude(path):
+    # Check exclude dirs
+    for excl in CONFIG["EXCLUDE_DIRS"]:
+        if f"/{excl}/" in path or path.endswith(f"/{excl}"):
+            return True
+    
+    # Check file size
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        if size_mb > CONFIG["MAX_FILE_SIZE_MB"]:
+            return True
+    except: pass
+    
+    return False
 
 def main():
     setup_env()
     parse_bash_config(CONFIG_FILE)
     
     if not CONFIG["SCAN_DIRS"]:
-        log("No hay directorios configurados en SCAN_DIRS.", "ERROR")
+        log("No hay directorios configurados.", "ERROR")
         sys.exit(1)
 
-    log(">>> Escaneo iniciado")
+    log(f">>> Escaneo iniciado. Modo: {CONFIG['ACTION_MODE']}")
     
-    # 1. Identificar archivos a escanear
+    # 1. Identificar archivos
     files_to_scan = []
     is_first_scan = not os.path.exists(FIRST_SCAN_FLAG)
     
     for directory in CONFIG["SCAN_DIRS"]:
-        if not os.path.exists(directory):
-            log(f"Directorio no existe: {directory}", "WARN")
-            continue
+        if not os.path.exists(directory): continue
 
         cmd = ["find", directory, "-type", "f"]
         if not is_first_scan:
-            # Solo recientes
             cmd.extend(["-mtime", f"-{CONFIG['SCAN_DAYS']}"])
-            log(f"Escaneando archivos recientes en {directory}")
-        else:
-            log(f"Escaneo inicial completo en {directory}")
         
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
-            files = result.stdout.splitlines()
-            files_to_scan.extend(files)
-        except subprocess.CalledProcessError as e:
-            log(f"Error listando archivos en {directory}: {e}", "ERROR")
+            raw_files = result.stdout.splitlines()
+            
+            # Filtrar en Python (Exclusiones y Tamaño)
+            for f in raw_files:
+                if not should_exclude(f):
+                    files_to_scan.append(f)
+                    
+        except Exception as e: log(f"Error find {directory}: {e}", "ERROR")
 
     if not files_to_scan:
-        log("No se encontraron archivos para escanear.")
-        log(">>> Escaneo finalizado")
+        log(">>> Fin (Sin archivos)")
         return
 
     log(f"Analizando {len(files_to_scan)} archivos...")
-    
-    # 2. Escanear con ClamAV
     infected_files = scan_files(files_to_scan)
     
-    # 3. Procesar infectados
+    # 2. Procesar
     for file_path, virus_name in infected_files.items():
-        log(f"[ALERTA] ClamAV detectó {virus_name} en {file_path}")
+        if not os.path.exists(file_path): continue # Puede haber sido movido
         
+        log(f"[ALERTA] Detectado: {file_path} ({virus_name})")
         file_hash = get_file_hash(file_path)
-        log(f"[INFO] SHA256: {file_hash}")
         
-        # Check whitelist
         if check_list(WHITELIST, file_hash):
-            log("Hash en whitelist. Ignorando.")
+            log("Whitelist. Ignorando.")
             append_to_list(CSV_FILE, f"{file_path},{file_hash},0,Whitelist,{datetime.datetime.now()}")
             continue
             
-        # Check cache de VT (para no gastar quota API)
         if check_list(HASH_CACHE, file_hash):
-            log("Hash ya consultado anteriormente. Saltando VT (política caché).")
-            # Podríamos re-checkear si pasó mucho tiempo, pero por ahora simple
+            log("Hash cacheado (ya revisado antes).")
+            # Si se quisiera re-verificar, eliminaríamos esta línea
             append_to_list(CSV_FILE, f"{file_path},{file_hash},?,Cache,{datetime.datetime.now()}")
             continue
             
         append_to_list(HASH_CACHE, file_hash)
-        
-        # Mover a Cuarentena
-        file_name = os.path.basename(file_path)
-        quarantine_path = os.path.join(QUAR_DIR, file_name)
-        try:
-            shutil.move(file_path, quarantine_path)
-        except Exception as e:
-            log(f"Error moviendo a cuarentena: {e}", "ERROR")
-            continue
 
-        # Consultar VirusTotal
-        positives = check_virustotal(file_hash, CONFIG["VT_API_KEY"])
+        # Lógica de Acción / Cuarentena Temporal para análisis seguro
+        action = CONFIG["ACTION_MODE"].lower()
+        temp_quarantine_path = os.path.join(QUAR_DIR, os.path.basename(file_path))
+        original_path = file_path
         
-        if positives > THRESHOLD:
-            log(f"[MALWARE] Confirmado ({positives} motores).")
-            append_to_list(CSV_FILE, f"{file_path},{file_hash},{positives},Malware,{datetime.datetime.now()}")
+        # Si NO es 'report', movemos preventivamente
+        if action != "report":
+            try:
+                shutil.move(file_path, temp_quarantine_path)
+                file_path = temp_quarantine_path # Actualizar referencia para operaciones futuras
+            except Exception as e: 
+                log(f"Fallo al mover a cuarentena: {e}", "ERROR")
+                # Si falla mover, seguimos analizando en el lugar original si es posible
+        
+        # Consultar VT
+        positives = check_virustotal(file_hash, CONFIG["VT_API_KEY"])
+        threshold = CONFIG["VT_THRESHOLD"]
+
+        is_malware = positives >= threshold
+        
+        if is_malware:
+            log(f"[MALWARE] Confirmado ({positives}/{threshold} motores).")
+            append_to_list(CSV_FILE, f"{original_path},{file_hash},{positives},Malware,{datetime.datetime.now()}")
             
-            body = (f"🚨 Malware detectado:\n"
-                    f"Archivo original: {file_path}\n"
-                    f"Hash: {file_hash}\n"
-                    f"Virus (ClamAV): {virus_name}\n"
-                    f"Detecciones VT: {positives}\n"
-                    f"Ubicación actual: {quarantine_path}")
-            send_alert("[Alerta ScanVT] Malware confirmado", body, CONFIG["MAIL_DEST"])
+            body = (f"Archivo: {original_path}\n"
+                    f"Virus: {virus_name}\n"
+                    f"Motores VT: {positives}\n"
+                    f"Acción: {action}")
+            notify(f"🚨 Malware: {os.path.basename(original_path)}", body)
+
+            if action == "delete":
+                try:
+                    if os.path.exists(file_path): os.remove(file_path)
+                    log(f"Archivo eliminado: {file_path}")
+                except Exception as e: log(f"Error eliminando: {e}", "ERROR")
             
-        elif positives >= 0: # 0 o bajo threshold
-            log(f"[FALSO POSITIVO] Solo {positives} motores. Restaurando.")
-            append_to_list(CSV_FILE, f"{file_path},{file_hash},{positives},Falso Positivo,{datetime.datetime.now()}")
+            elif action == "report":
+                log("Modo Reporte: Archivo se mantiene en sitio original.")
+            
+            # Si es 'quarantine', ya está movido, así que no hacemos nada más.
+
+        else:
+            # Falso Positivo o Bajo Threshold
+            log(f"[FALSO POSITIVO] {positives} motores. Restaurando/Ignorando.")
+            append_to_list(CSV_FILE, f"{original_path},{file_hash},{positives},Falso Positivo,{datetime.datetime.now()}")
             append_to_list(WHITELIST, file_hash)
             
-            try:
-                shutil.move(quarantine_path, file_path)
-                body = (f"⚠️ Falso positivo restaurado:\n"
-                        f"Archivo: {file_path}\n"
-                        f"Hash: {file_hash}\n"
-                        f"Detecciones VT: {positives}")
-                send_alert("[ScanVT] Falso positivo restaurado", body, CONFIG["MAIL_DEST"])
-            except Exception as e:
-                log(f"Error restaurando archivo: {e}", "ERROR")
+            # Si lo habíamos movido, hay que devolverlo
+            if action != "report" and os.path.exists(temp_quarantine_path):
+                try:
+                    shutil.move(temp_quarantine_path, original_path)
+                    log("Archivo restaurado.")
+                except Exception as e: log(f"Error restaurando: {e}", "ERROR")
+            
+            # Notificar FP restaurado? Opcional, puede generar ruido.
+            # notify("⚠️ Falso Positivo Restaurado", f"{original_path} ({positives} hits)")
 
-    # 4. Limpieza Cuarentena
+    # Limpieza
     retention = CONFIG["QUAR_RETENTION_DAYS"]
     if retention > 0:
-        log(f"Limpiando cuarentena (archivos > {retention} días)...")
         try:
             cmd = ["find", QUAR_DIR, "-type", "f", "-mtime", f"+{retention}", "-delete"]
-            subprocess.run(cmd, check=True)
-        except Exception as e:
-            log(f"Error limpiando cuarentena: {e}", "ERROR")
+            subprocess.run(cmd)
+        except: pass
 
     if not os.path.exists(FIRST_SCAN_FLAG):
         open(FIRST_SCAN_FLAG, 'a').close()
         
-    log(">>> Escaneo finalizado")
+    log(">>> Fin")
 
 if __name__ == "__main__":
     main()
