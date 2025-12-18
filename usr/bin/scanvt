@@ -1,94 +1,304 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import hashlib
+import json
+import urllib.request
+import urllib.error
+import datetime
+import shutil
+import re
 
-#!/bin/bash
+# --- Configuración y Constantes ---
+CONFIG_FILE = "/etc/scanvt/config"
+LOG_FILE = "/var/log/scanvt/scan.log"
+HASH_CACHE = "/var/cache/scanvt/hashes.txt"
+WHITELIST = "/var/cache/scanvt/whitelist.txt"
+QUAR_DIR = "/var/quarantine"
+FIRST_SCAN_FLAG = "/var/cache/scanvt/.first_scan_done"
+CSV_DIR = "/root/scanvt"
+TIMESTAMP = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+CSV_FILE = f"{CSV_DIR}/scanvt_report_{TIMESTAMP}.csv"
+THRESHOLD = 1
 
-CONFIG_FILE="/etc/scanvt/config"
-LOG_FILE="/var/log/scanvt/scan.log"
-HASH_CACHE="/var/cache/scanvt/hashes.txt"
-WHITELIST="/var/cache/scanvt/whitelist.txt"
-QUAR_DIR="/var/quarantine"
-FIRST_SCAN_FLAG="/var/cache/scanvt/.first_scan_done"
-CSV_DIR="/root/scanvt"
-TIMESTAMP=$(date +'%Y-%m-%d_%H-%M-%S')
-CSV_FILE="$CSV_DIR/scanvt_report_$TIMESTAMP.csv"
-THRESHOLD=1
+# Valores por defecto si falla la config
+CONFIG = {
+    "VT_API_KEY": "",
+    "SCAN_DIRS": [],
+    "SCAN_DAYS": 7,
+    "MAIL_DEST": "root",
+    "QUAR_RETENTION_DAYS": 0
+}
 
-mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$HASH_CACHE")" "$QUAR_DIR" "$CSV_DIR"
-touch "$HASH_CACHE" "$WHITELIST"
-echo "Archivo,Hash,Detecciones,Estado,Fecha" > "$CSV_FILE"
+def log(message, level="INFO"):
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    msg = f"[{timestamp}] [{level}] {message}"
+    print(msg)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(msg + "\n")
+    except Exception as e:
+        print(f"Error escribiendo log: {e}")
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "Archivo de configuración no encontrado: $CONFIG_FILE"
-    exit 1
-fi
+def parse_bash_config(file_path):
+    """Intenta leer variables simples y arrays de bash del archivo de config."""
+    if not os.path.exists(file_path):
+        return
+    
+    with open(file_path, 'r') as f:
+        content = f.read()
 
-source "$CONFIG_FILE"
+    # Regex para arrays bash: VAR=("val1" "val2")
+    # Nota: Esto es un parser simple y puede fallar con estructuras complejas
+    array_matches = re.findall(r'(\w+)=\((.*?)\)', content, re.DOTALL)
+    for key, val_str in array_matches:
+        # Extraer items entre comillas
+        items = re.findall(r'"([^"]*)"', val_str)
+        if not items: # Intentar sin comillas
+            items = val_str.split()
+        CONFIG[key] = items
 
-echo "[$(date)] >>> Escaneo iniciado" >> "$LOG_FILE"
+    # Regex para variables simples: VAR="valor" o VAR=valor
+    simple_matches = re.findall(r'(\w+)=["\\]?([^"\'\n\(\)]+)["\\]?', content)
+    for key, val in simple_matches:
+        if key not in CONFIG: # Prioridad al array si ya se encontró
+            CONFIG[key] = val
 
-for DIR in "${SCAN_DIRS[@]}"; do
-    if [[ ! -f "$FIRST_SCAN_FLAG" ]]; then
-        echo "[INFO] Ejecutando escaneo completo inicial en $DIR" >> "$LOG_FILE"
-        find "$DIR" -type f -print0 |
-        while IFS= read -r -d '' file; do
-    else
-        echo "[INFO] Ejecutando escaneo por archivos recientes (últimos $SCAN_DAYS días) en $DIR" >> "$LOG_FILE"
-        find "$DIR" -type f -mtime -"${SCAN_DAYS}" -print0 |
-        while IFS= read -r -d '' file; do
-    fi
-        echo "[INFO] Escaneando $file" >> "$LOG_FILE"
+    # Conversiones de tipo
+    try:
+        CONFIG["SCAN_DAYS"] = int(CONFIG.get("SCAN_DAYS", 7))
+    except:
+        CONFIG["SCAN_DAYS"] = 7
+        
+    try:
+        CONFIG["QUAR_RETENTION_DAYS"] = int(CONFIG.get("QUAR_RETENTION_DAYS", 0))
+    except:
+        CONFIG["QUAR_RETENTION_DAYS"] = 0
 
-        clamscan --no-summary "$file" | grep -q FOUND
-        if [[ $? -eq 0 ]]; then
-            echo "[ALERTA] ClamAV detectó amenaza: $file" >> "$LOG_FILE"
+def setup_env():
+    dirs = [os.path.dirname(LOG_FILE), os.path.dirname(HASH_CACHE), QUAR_DIR, CSV_DIR]
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+    
+    for f in [HASH_CACHE, WHITELIST]:
+        if not os.path.exists(f):
+            open(f, 'a').close()
+            
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w') as f:
+            f.write("Archivo,Hash,Detecciones,Estado,Fecha\n")
 
-            HASH=$(sha256sum "$file" | awk '{print $1}')
-            echo "[INFO] SHA256: $HASH" >> "$LOG_FILE"
+def get_file_hash(filepath):
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        log(f"Error calculando hash de {filepath}: {e}", "ERROR")
+        return None
 
-            if grep -q "$HASH" "$WHITELIST"; then
-                echo "[INFO] Hash en whitelist. Ignorando archivo." >> "$LOG_FILE"
-                echo "$file,$HASH,0,Whitelist,$(date)" >> "$CSV_FILE"
-                continue
-            fi
+def check_list(file_path, search_hash):
+    if not os.path.exists(file_path):
+        return False
+    with open(file_path, 'r') as f:
+        return search_hash in f.read()
 
-            if grep -q "$HASH" "$HASH_CACHE"; then
-                echo "[INFO] Hash ya consultado. Saltando consulta." >> "$LOG_FILE"
-                echo "$file,$HASH,?,Cache,$(date)" >> "$CSV_FILE"
-                continue
-            fi
+def append_to_list(file_path, text):
+    with open(file_path, 'a') as f:
+        f.write(text + "\n")
 
-            echo "$HASH" >> "$HASH_CACHE"
+def scan_files(files_to_scan):
+    """Ejecuta clamdscan (o clamscan fallback) sobre una lista de archivos."""
+    if not files_to_scan:
+        return {}
 
-            ORIG_PATH="$file"
-            FILE_NAME=$(basename "$file")
-            QUAR_FILE="$QUAR_DIR/$FILE_NAME"
-            mv "$file" "$QUAR_FILE"
+    infected_files = {}
+    
+    # Intentar usar clamdscan (multithreaded daemon) primero
+    cmd = ["clamdscan", "--no-summary", "--fdpass", "-"]
+    # Si no quieres usar stdin lista de archivos, clamdscan puede recibir argumentos, 
+    # pero args list puede ser muy largo. Pasar por stdin es mejor ("-").
+    
+    try:
+        # Pasamos la lista de archivos via STDIN
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate(input="\n".join(files_to_scan))
+        
+        # Clamdscan return codes: 0: No virus, 1: Virus found, 2: Error
+        if proc.returncode == 2:
+            log("clamdscan reportó error (o no está corriendo). Intentando fallback a clamscan (lento).", "WARN")
+            raise Exception("clamdscan failed")
+            
+    except Exception as e:
+        # Fallback a clamscan (lento)
+        log("Usando clamscan fallback...", "INFO")
+        cmd = ["clamscan", "--no-summary", "-"]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate(input="\n".join(files_to_scan))
 
-            VT_RESPONSE=$(curl --silent --request GET                     --url "https://www.virustotal.com/api/v3/files/$HASH"                     --header "x-apikey: $VT_API_KEY")
+    # Parsear salida: "/path/to/file: VirusName FOUND"
+    for line in stdout.splitlines():
+        if " FOUND" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                file_path = parts[0].strip()
+                virus_name = parts[1].replace(" FOUND", "").strip()
+                infected_files[file_path] = virus_name
 
-            POSITIVES=$(echo "$VT_RESPONSE" | jq '.data.attributes.last_analysis_stats.malicious // 0')
+    return infected_files
 
-            if [[ "$POSITIVES" -gt "$THRESHOLD" ]]; then
-                echo "[MALWARE] Confirmado ($POSITIVES motores). Archivo permanece en cuarentena." >> "$LOG_FILE"
-                echo "$file,$HASH,$POSITIVES,Malware,$(date)" >> "$CSV_FILE"
-                echo -e "🚨 Malware detectado:\nArchivo: $ORIG_PATH\nHash: $HASH\nDetecciones: $POSITIVES\nMovido a: $QUAR_FILE\nFecha: $(date)"                     | mail -s "[Alerta ClamAV] Malware confirmado" "$MAIL_DEST"
-            else
-                echo "[FALSO POSITIVO] Solo $POSITIVES motores. Restaurando archivo y agregando a whitelist." >> "$LOG_FILE"
-                echo "$HASH" >> "$WHITELIST"
-                mv "$QUAR_FILE" "$ORIG_PATH"
-                echo "$file,$HASH,$POSITIVES,Falso Positivo,$(date)" >> "$CSV_FILE"
-                echo -e "⚠️ Falso positivo:\nArchivo: $ORIG_PATH\nHash: $HASH\nDetecciones: $POSITIVES\nRestaurado\nFecha: $(date)"                     | mail -s "[ClamAV] Falso positivo restaurado" "$MAIL_DEST"
-            fi
-        fi
-    done
-done
+def check_virustotal(file_hash, api_key):
+    url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
+    headers = {"x-apikey": api_key}
+    req = urllib.request.Request(url, headers=headers)
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            stats = data['data']['attributes']['last_analysis_stats']
+            return stats['malicious']
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            log(f"Hash {file_hash} no encontrado en VirusTotal.", "INFO")
+            return 0 # Asumimos limpio si VT no lo conoce (o política estricta?)
+        log(f"Error consultando VirusTotal: {e}", "ERROR")
+        return -1
+    except Exception as e:
+        log(f"Error general VT: {e}", "ERROR")
+        return -1
 
-# Control de limpieza de cuarentena
-if [[ "$QUAR_RETENTION_DAYS" =~ ^[0-9]+$ && "$QUAR_RETENTION_DAYS" -gt 0 ]]; then
-    echo "[INFO] Eliminando archivos de cuarentena mayores a $QUAR_RETENTION_DAYS días" >> "$LOG_FILE"
-    find "$QUAR_DIR" -type f -mtime +"$QUAR_RETENTION_DAYS" -exec rm -f {} \;
-else
-    echo "[INFO] No se eliminarán archivos de cuarentena automáticamente" >> "$LOG_FILE"
-fi
+def send_alert(subject, body, dest):
+    if not dest or "@" not in dest:
+        return
+    try:
+        # Usar comando 'mail' del sistema
+        proc = subprocess.Popen(['mail', '-s', subject, dest], stdin=subprocess.PIPE, text=True)
+        proc.communicate(input=body)
+    except Exception as e:
+        log(f"No se pudo enviar correo: {e}", "ERROR")
 
-touch "$FIRST_SCAN_FLAG"
-echo "[$(date)] >>> Escaneo finalizado" >> "$LOG_FILE"
+def main():
+    setup_env()
+    parse_bash_config(CONFIG_FILE)
+    
+    if not CONFIG["SCAN_DIRS"]:
+        log("No hay directorios configurados en SCAN_DIRS.", "ERROR")
+        sys.exit(1)
+
+    log(">>> Escaneo iniciado")
+    
+    # 1. Identificar archivos a escanear
+    files_to_scan = []
+    is_first_scan = not os.path.exists(FIRST_SCAN_FLAG)
+    
+    for directory in CONFIG["SCAN_DIRS"]:
+        if not os.path.exists(directory):
+            log(f"Directorio no existe: {directory}", "WARN")
+            continue
+
+        cmd = ["find", directory, "-type", "f"]
+        if not is_first_scan:
+            # Solo recientes
+            cmd.extend(["-mtime", f"-{CONFIG['SCAN_DAYS']}"])
+            log(f"Escaneando archivos recientes en {directory}")
+        else:
+            log(f"Escaneo inicial completo en {directory}")
+        
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
+            files = result.stdout.splitlines()
+            files_to_scan.extend(files)
+        except subprocess.CalledProcessError as e:
+            log(f"Error listando archivos en {directory}: {e}", "ERROR")
+
+    if not files_to_scan:
+        log("No se encontraron archivos para escanear.")
+        log(">>> Escaneo finalizado")
+        return
+
+    log(f"Analizando {len(files_to_scan)} archivos...")
+    
+    # 2. Escanear con ClamAV
+    infected_files = scan_files(files_to_scan)
+    
+    # 3. Procesar infectados
+    for file_path, virus_name in infected_files.items():
+        log(f"[ALERTA] ClamAV detectó {virus_name} en {file_path}")
+        
+        file_hash = get_file_hash(file_path)
+        log(f"[INFO] SHA256: {file_hash}")
+        
+        # Check whitelist
+        if check_list(WHITELIST, file_hash):
+            log("Hash en whitelist. Ignorando.")
+            append_to_list(CSV_FILE, f"{file_path},{file_hash},0,Whitelist,{datetime.datetime.now()}")
+            continue
+            
+        # Check cache de VT (para no gastar quota API)
+        if check_list(HASH_CACHE, file_hash):
+            log("Hash ya consultado anteriormente. Saltando VT (política caché).")
+            # Podríamos re-checkear si pasó mucho tiempo, pero por ahora simple
+            append_to_list(CSV_FILE, f"{file_path},{file_hash},?,Cache,{datetime.datetime.now()}")
+            continue
+            
+        append_to_list(HASH_CACHE, file_hash)
+        
+        # Mover a Cuarentena
+        file_name = os.path.basename(file_path)
+        quarantine_path = os.path.join(QUAR_DIR, file_name)
+        try:
+            shutil.move(file_path, quarantine_path)
+        except Exception as e:
+            log(f"Error moviendo a cuarentena: {e}", "ERROR")
+            continue
+
+        # Consultar VirusTotal
+        positives = check_virustotal(file_hash, CONFIG["VT_API_KEY"])
+        
+        if positives > THRESHOLD:
+            log(f"[MALWARE] Confirmado ({positives} motores).")
+            append_to_list(CSV_FILE, f"{file_path},{file_hash},{positives},Malware,{datetime.datetime.now()}")
+            
+            body = (f"🚨 Malware detectado:\n"
+                    f"Archivo original: {file_path}\n"
+                    f"Hash: {file_hash}\n"
+                    f"Virus (ClamAV): {virus_name}\n"
+                    f"Detecciones VT: {positives}\n"
+                    f"Ubicación actual: {quarantine_path}")
+            send_alert("[Alerta ScanVT] Malware confirmado", body, CONFIG["MAIL_DEST"])
+            
+        elif positives >= 0: # 0 o bajo threshold
+            log(f"[FALSO POSITIVO] Solo {positives} motores. Restaurando.")
+            append_to_list(CSV_FILE, f"{file_path},{file_hash},{positives},Falso Positivo,{datetime.datetime.now()}")
+            append_to_list(WHITELIST, file_hash)
+            
+            try:
+                shutil.move(quarantine_path, file_path)
+                body = (f"⚠️ Falso positivo restaurado:\n"
+                        f"Archivo: {file_path}\n"
+                        f"Hash: {file_hash}\n"
+                        f"Detecciones VT: {positives}")
+                send_alert("[ScanVT] Falso positivo restaurado", body, CONFIG["MAIL_DEST"])
+            except Exception as e:
+                log(f"Error restaurando archivo: {e}", "ERROR")
+
+    # 4. Limpieza Cuarentena
+    retention = CONFIG["QUAR_RETENTION_DAYS"]
+    if retention > 0:
+        log(f"Limpiando cuarentena (archivos > {retention} días)...")
+        try:
+            cmd = ["find", QUAR_DIR, "-type", "f", "-mtime", f"+{retention}", "-delete"]
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            log(f"Error limpiando cuarentena: {e}", "ERROR")
+
+    if not os.path.exists(FIRST_SCAN_FLAG):
+        open(FIRST_SCAN_FLAG, 'a').close()
+        
+    log(">>> Escaneo finalizado")
+
+if __name__ == "__main__":
+    main()

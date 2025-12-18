@@ -1,86 +1,82 @@
-
 # scanvt
 
-`scanvt` es una herramienta de escaneo de malware automatizado para sistemas Linux. Utiliza **ClamAV** para el análisis de archivos y **VirusTotal** para confirmar si las amenazas detectadas son reales o falsos positivos. Los resultados se registran en CSV, se envían alertas por correo, y los archivos sospechosos se manejan cuidadosamente.
+`scanvt` es una herramienta de escaneo de malware automatizado para sistemas Linux. Utiliza **ClamAV** para el análisis de archivos y **VirusTotal** para confirmar si las amenazas detectadas son reales o falsos positivos.
+
+**Novedad v1.1:** El núcleo ha sido reescrito en **Python 3** para mayor robustez y velocidad, integrándose nativamente con el daemon de ClamAV (`clamdscan`) para escaneos ultrarrápidos.
 
 ## ✨ Características
 
-- Escaneo automático de archivos modificados recientemente.
-- Primer escaneo completo del sistema.
-- Consulta con la API de VirusTotal para evitar falsos positivos.
-- Whitelist local para evitar consultas redundantes.
-- Informes detallados en CSV por cada ejecución.
-- Servicio y temporizador systemd.
-- Soporte para múltiples directorios configurables.
-- Configuración centralizada en `/etc/scanvt/config`.
-
+- **Alto Rendimiento:** Integración con `clamav-daemon` para escaneos instantáneos (sin tiempos de carga de DB).
+- **Inteligencia:** Consulta a la API de VirusTotal para verificar detecciones y reducir falsos positivos.
+- **Automatización:** Escaneo de archivos recientes o completos, gestionado por `systemd`.
+- **Seguridad:** Aislamiento inmediato de amenazas en cuarentena.
+- **Gestión de Falsos Positivos:** Restauración automática y Whitelist local si VirusTotal lo confirma limpio.
+- **Reportes:** Logs detallados, informes CSV y alertas por correo electrónico.
 
 ## 🔑 Cómo obtener tu API key de VirusTotal
 
-1. Ir a [https://www.virustotal.com/gui/join-us](https://www.virustotal.com/gui/join-us) y crear una cuenta gratuita.
-2. Una vez registrado, iniciá sesión.
-3. Hacé clic en tu avatar (arriba a la derecha) y elegí **API Key**.
-4. Copiá la clave que aparece y pegala en el archivo `/etc/scanvt/config`:
+1. Regístrate gratis en [VirusTotal](https://www.virustotal.com/gui/join-us).
+2. Ve a tu perfil > **API Key**.
+3. Copia la clave en `/etc/scanvt/config`:
 
 ```bash
 VT_API_KEY="tu_clave_api_aqui"
 ```
 
-⚠️ La API gratuita de VirusTotal tiene límites: 500 consultas por día y 4 por minuto.
-
 ## 📦 Instalación
 
-### Desde paquete .deb
+### Requisitos Previos
+
+El sistema ahora requiere Python 3 (instalado por defecto en la mayoría de distros) y se recomienda encarecidamente `clamav-daemon` para velocidad.
 
 ```bash
-sudo dpkg -i scanvt_1.0_all.deb
-sudo systemctl daemon-reexec
-sudo systemctl enable --now scanvt-generate.service scanvt.timer
+sudo apt update
+sudo apt install clamav clamav-daemon mailutils -y
 ```
 
-### Dependencias
+### Instalación del Paquete
 
 ```bash
-sudo apt install clamav jq curl mailutils -y
+sudo dpkg -i scanvt_1.1_all.deb
+sudo systemctl daemon-reload
+sudo systemctl enable --now scanvt-generate.service scanvt.timer
 ```
 
 ## ⚙️ Configuración
 
-Edita `/etc/scanvt/config`:
+Archivo: `/etc/scanvt/config`
 
 ```bash
+# API Key de VirusTotal (Obligatorio)
 VT_API_KEY="tu_api_key_virustotal"
+
+# Directorios a vigilar
 SCAN_DIRS=("/home" "/var/www")
+
+# Escanear archivos modificados en los últimos X días
 SCAN_DAYS=10
+
+# Hora del escaneo diario
 SCAN_HOUR="03:00"
+
+# Días de ejecución
 SCAN_DAYS_OF_WEEK="Mon,Tue,Wed,Thu,Fri"
+
+# Email para alertas
 MAIL_DEST="admin@tudominio.com"
+
+# Días para retener archivos en cuarentena (0 = nunca borrar)
 QUAR_RETENTION_DAYS=7
 ```
 
 ## 🧪 Resultados
 
-- Archivos en cuarentena: `/var/quarantine`
-- Logs: `/var/log/scanvt/scan.log`
-- Whitelist de falsos positivos: `/var/cache/scanvt/whitelist.txt`
-- CSV por escaneo: `/root/scanvt/scanvt_report_YYYY-MM-DD_HH-MM-SS.csv`
-
-## 🧹 Limpieza
-
-- Si `QUAR_RETENTION_DAYS=0`, los archivos en cuarentena **no se eliminan automáticamente**.
-- Si `QUAR_RETENTION_DAYS=N`, los archivos en cuarentena se eliminan tras N días.
-
-## ✉️ Alertas
-
-Se enviarán correos cuando:
-- Se detecte malware confirmado.
-- Se restaure un archivo considerado falso positivo.
-
-> El CSV del escaneo se adjunta al correo.
+- **Cuarentena:** `/var/quarantine`
+- **Logs:** `/var/log/scanvt/scan.log`
+- **Whitelist:** `/var/cache/scanvt/whitelist.txt`
+- **Reportes CSV:** `/root/scanvt/`
 
 ## 🔧 Mantenimiento
 
 Mantenedor: **Juan Manuel Biglia**  
 Contacto: `juanma.biglia@gmail.com`
-
----
